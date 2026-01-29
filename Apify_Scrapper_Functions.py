@@ -1,4 +1,4 @@
-
+import os
 import pandas as pd
 import time
 from fuzzywuzzy import fuzz, process
@@ -6,6 +6,10 @@ import re
 from apify_client import ApifyClient
 import requests
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def Get_Phone_Number_From_Facebook(df):
@@ -21,12 +25,43 @@ def Get_Phone_Number_From_Facebook(df):
         else:
             return x
 
+    def clean_facebook_url(url):
+        """Clean and validate Facebook URL for the scraper."""
+        if not url or pd.isna(url):
+            return None
+
+        url = str(url).strip()
+
+        # Skip personal profiles - Actor only works with business pages
+        if 'profile.php' in url:
+            return None
+
+        # Remove /about or /about_profile_transparency suffixes
+        url = re.sub(r'/about.*$', '', url)
+
+        # Ensure it's a Facebook URL
+        if 'facebook.com' not in url.lower():
+            return None
+
+        return url
+
     facebook_only_df["Facebook"] = facebook_only_df["Facebook"].apply(clean_facebook)
-    facebook_only_df = facebook_only_df[facebook_only_df["Facebook"].notna() & (facebook_only_df["Facebook"] != "")]
+    facebook_only_df["Facebook_Cleaned"] = facebook_only_df["Facebook"].apply(clean_facebook_url)
 
-    client = ApifyClient("apify_api_gak2ulhepgd4uzBseSLQtiHnb9KGxy3iMwp2")
+    # Separate valid URLs from invalid/filtered ones
+    valid_facebook_df = facebook_only_df[facebook_only_df["Facebook_Cleaned"].notna() & (facebook_only_df["Facebook_Cleaned"] != "")].copy()
+    invalid_facebook_df = facebook_only_df[facebook_only_df["Facebook_Cleaned"].isna() | (facebook_only_df["Facebook_Cleaned"] == "")].copy()
 
-    BATCH_SIZE = 100
+    # Use cleaned URLs for processing
+    valid_facebook_df["Facebook"] = valid_facebook_df["Facebook_Cleaned"]
+    valid_facebook_df = valid_facebook_df.drop(columns=["Facebook_Cleaned"])
+    invalid_facebook_df = invalid_facebook_df.drop(columns=["Facebook_Cleaned"])
+
+    print(f"Valid Facebook URLs: {len(valid_facebook_df)}, Filtered out (profiles/invalid): {len(invalid_facebook_df)}")
+
+    client = ApifyClient(os.getenv("APIFY_API_KEY"))
+
+    BATCH_SIZE = 500
     MAX_CONCURRENCY = 3
 
     def validate_singapore_number(phone):
@@ -66,15 +101,15 @@ def Get_Phone_Number_From_Facebook(df):
             return [], str(e)
 
 
-    if len(facebook_only_df) > 0:
-        print(f"Processing {len(facebook_only_df)} Facebook pages...")
+    if len(valid_facebook_df) > 0:
+        print(f"Processing {len(valid_facebook_df)} Facebook pages...")
 
         total_phones_found = 0
-        total_rows = len(facebook_only_df)
+        total_rows = len(valid_facebook_df)
         num_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
 
         for batch_idx in range(0, total_rows, BATCH_SIZE):
-            batch = facebook_only_df.iloc[batch_idx:batch_idx + BATCH_SIZE]
+            batch = valid_facebook_df.iloc[batch_idx:batch_idx + BATCH_SIZE]
             facebook_urls = [str(row['Facebook']).strip() for _, row in batch.iterrows()]
             batch_indices = list(batch.index)
 
@@ -95,7 +130,7 @@ def Get_Phone_Number_From_Facebook(df):
             if error:
                 print(f"  ERROR: {error}")
                 for idx in batch_indices:
-                    facebook_only_df.loc[idx, 'Phones'] = None
+                    valid_facebook_df.loc[idx, 'Phones'] = None
                 continue
 
             print(f"  Retrieved {len(items)} results from Apify")
@@ -121,25 +156,31 @@ def Get_Phone_Number_From_Facebook(df):
                     phone = validate_singapore_number(raw_phone)
 
                     if phone:
-                        facebook_only_df.loc[idx, 'Phones'] = phone
+                        valid_facebook_df.loc[idx, 'Phones'] = phone
                         total_phones_found += 1
                     else:
-                        facebook_only_df.loc[idx, 'Phones'] = None
+                        valid_facebook_df.loc[idx, 'Phones'] = None
                 else:
-                    facebook_only_df.loc[idx, 'Phones'] = None
+                    valid_facebook_df.loc[idx, 'Phones'] = None
 
             if batch_idx + BATCH_SIZE < total_rows:
                 time.sleep(3)
 
         print(f"Done! Found {total_phones_found}/{total_rows} phone numbers.")
+    else:
+        print("No valid Facebook URLs to process.")
+        valid_facebook_df["Phones"] = None
 
-    df_with_phones = facebook_only_df[facebook_only_df["Phones"].notna()]
-    df_without_phones = facebook_only_df[facebook_only_df["Phones"].isna()]
+    df_with_phones = valid_facebook_df[valid_facebook_df["Phones"].notna()]
+    df_without_phones = valid_facebook_df[valid_facebook_df["Phones"].isna()]
 
     final_df_1 = df_with_phones[df_with_phones["Phones"].duplicated(keep=False) == False]
     refilter_df_1 = df_with_phones[df_with_phones["Phones"].duplicated(keep=False) == True]
 
-    df_without_phones_2 = pd.concat([refilter_df_1, df_without_phones], ignore_index=True)
+    # Include filtered/invalid URLs in the no-phone list
+    df_without_phones_2 = pd.concat([refilter_df_1, df_without_phones, invalid_facebook_df], ignore_index=True)
+
+    print(f"Summary: {len(final_df_1)} with phones, {len(df_without_phones_2)} without phones (includes {len(invalid_facebook_df)} filtered URLs)")
 
     return final_df_1, df_without_phones_2
 
@@ -203,10 +244,10 @@ def Get_Phone_Number_From_Website(df):
     RecordOwl_Leads = df.copy()
 
     # --- Initialize Apify client ---
-    client = ApifyClient("apify_api_gak2ulhepgd4uzBseSLQtiHnb9KGxy3iMwp2")
+    client = ApifyClient(os.getenv("APIFY_API_KEY"))
 
     # COST-OPTIMIZED BATCH CONFIGURATION
-    BATCH_SIZE = 100         # Increased batch size for fewer actor runs
+    BATCH_SIZE = 500         # Increased batch size for fewer actor runs
     MAX_CONCURRENCY = 3      # Increased concurrency for faster completion
     MAX_RETRIES = 1          # Reduced retries (saves compute on failures)
     PAGE_TIMEOUT = 15        # Reduced timeout from 30s
@@ -626,9 +667,8 @@ def Get_Phone_Number_From_Website(df):
             "ignoreSslErrors": True,                   # Skip SSL validation (faster)
             "proxyConfiguration": {
                 "useApifyProxy": True,
-                "apifyProxyGroups": ["RESIDENTIAL"]    # Keep residential as requested
+                "apifyProxyGroups": ["DATACENTER"],
             },
-            "proxyRotation": "RECOMMENDED",
         }
 
         print(f"  🚀 Launching Apify actor with {MAX_CONCURRENCY} concurrent browsers...")
@@ -676,7 +716,7 @@ def Get_Phone_Number_From_Website(df):
     print(f"   • Function timeout: {FUNCTION_TIMEOUT}s (optimized)")
     print(f"   • Retries: {MAX_RETRIES} (minimize compute waste)")
     print(f"   • Browser: Chromium (lightweight)")
-    print(f"   • Proxy: RESIDENTIAL (maintained)")
+    print(f"   • Proxy: DATACENTER (cost-optimized)")
     print(f"   • Strategy: Contact page → Homepage fallback")
     print("="*70)
 
@@ -855,6 +895,21 @@ def Get_Phone_Number_From_Website(df):
         how='left'
     )
 
+    # Extract phone numbers into standard columns and track count
+    phones_found_count = 0
+    for idx, row in RecordOwl_Leads_Enriched.iterrows():
+        phones = row.get('Website_Phones')
+        if phones and isinstance(phones, list) and len(phones) > 0:
+            # Take the first phone number
+            RecordOwl_Leads_Enriched.at[idx, 'PIC NAME 1 Contact Number'] = phones[0]
+            RecordOwl_Leads_Enriched.at[idx, 'PIC 1 Source'] = "Website"
+            phones_found_count += 1
+
+    # Drop the scraper metadata columns - keep only the extracted phone data
+    columns_to_drop = ['Website_Scrape_Status', 'Website_Scrape_Error', 'Website_Phones',
+                       'Website_Contact_Page', 'Website_Page_Type']
+    RecordOwl_Leads_Enriched = RecordOwl_Leads_Enriched.drop(columns=columns_to_drop, errors='ignore')
+
     print(f"\n{'='*70}")
     print("✅ PROCESSING COMPLETE")
     print(f"{'='*70}")
@@ -863,7 +918,7 @@ def Get_Phone_Number_From_Website(df):
     print(f"   • Websites verified accessible: {verified_count}")
     print(f"   • Websites skipped (keywords): {skipped_count}")
     print(f"   • Websites scraped: {len(Website_Scraped_Results)}")
-    print(f"   • Phones found: {len(RecordOwl_Leads_Enriched[RecordOwl_Leads_Enriched['Website_Phones'].notna()])}")
+    print(f"   • Phones found: {phones_found_count}")
     print(f"{'='*70}\n")
 
     return RecordOwl_Leads_Enriched
